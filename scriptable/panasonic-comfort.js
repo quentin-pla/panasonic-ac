@@ -7,6 +7,7 @@
 // each "Run Script" → this script, "Run Immediately" ON) OR Pushcut Automation Server.
 // Step timing has up to one cron-interval skew — acceptable for thermal smoothing.
 // Manual user change of mode/temp during transition aborts it (safety).
+// Multiple devices: DEVICE_GUIDS comma-separated, empty => all devices in account.
 
 // ============================================================
 // CONFIG — edit these values
@@ -16,11 +17,11 @@
 const APP_VERSION_OVERRIDE = '';
 const APP_VERSION_FALLBACK = '4.3.0';
 let APP_VERSION = APP_VERSION_OVERRIDE || APP_VERSION_FALLBACK; // resolved in main()
-const DEVICE_GUID  = '';     // empty => auto-pick first device from getGroups
+const DEVICE_GUIDS = '';     // comma-separated GUIDs, empty => auto-pick ALL devices
 const DRY_RUN      = true;   // true => only log, never call setParameters (safe default)
 const PCC_REFRESH_KEY = 'pcc_refresh';
 
-const TRANSITION_KEY = 'pcc_transition';   // Keychain JSON state
+const TRANSITION_KEY = 'pcc_transition';   // Keychain JSON: { [guid]: txn|null }
 const DRY_TARGET_TEMP = 20;
 // Wait seconds before stepping down FROM the keyed fan speed
 const STEP_INTERVALS_SEC = { 5: 180, 4: 300, 3: 600, 2: 600, 1: 600 };
@@ -271,94 +272,51 @@ function buildTransitionPlan(currentFanSpeed, currentEcoMode) {
 }
 
 // ============================================================
-// Keychain JSON helpers
+// Keychain transitions map helpers
+// Shape: { [guid]: txn|null }
+// Migration: old single-value (non-object or object with plan/startMs) → reset to {}
 // ============================================================
-function loadTransition() {
-  if (!Keychain.contains(TRANSITION_KEY)) return null;
-  try { return JSON.parse(Keychain.get(TRANSITION_KEY)); } catch { return null; }
-}
-function saveTransition(t) { Keychain.set(TRANSITION_KEY, JSON.stringify(t)); }
-function clearTransition() { if (Keychain.contains(TRANSITION_KEY)) Keychain.remove(TRANSITION_KEY); }
-
-// ============================================================
-// Main flow
-// ============================================================
-async function fetchCurrentAppVersion() {
-  if (APP_VERSION_OVERRIDE) return APP_VERSION_OVERRIDE;
+function loadTransitions() {
+  if (!Keychain.contains(TRANSITION_KEY)) return {};
   try {
-    const req = new Request('https://itunes.apple.com/lookup?id=1348640525');
-    req.method = 'GET';
-    const data = await req.loadJSON();
-    return data?.results?.[0]?.version || APP_VERSION_FALLBACK;
-  } catch (e) {
-    console.log('iTunes lookup failed, using fallback: ' + e.message);
-    return APP_VERSION_FALLBACK;
-  }
-}
-
-async function main() {
-  // 0. Resolve current X-APP-VERSION (Panasonic gates on this server-side)
-  APP_VERSION = await fetchCurrentAppVersion();
-  console.log('X-APP-VERSION = ' + APP_VERSION);
-
-  // 1. Load refresh token from Keychain
-  const rt = Keychain.contains(PCC_REFRESH_KEY) ? Keychain.get(PCC_REFRESH_KEY) : null;
-  if (!rt) {
-    notify('Panasonic AC', 'No refresh token — run seed on Mac then Keychain.set once');
-    return;
-  }
-
-  // 2. Refresh OAuth token
-  let tokenResp;
-  try {
-    tokenResp = await httpPost(
-      AUTH_BASE + '/oauth/token',
-      {
-        'Auth0-Client': AUTH0_CLIENT,
-        'Content-Type': 'application/json',
-        'User-Agent': 'okhttp/4.10.0'
-      },
-      {
-        scope: 'openid offline_access comfortcloud.control a2w.control',
-        client_id: CLIENT_ID,
-        refresh_token: rt,
-        grant_type: 'refresh_token'
-      }
-    );
-  } catch (e) {
-    notify('Panasonic AC', 'Token refresh failed — re-seed refresh token');
-    return;
-  }
-  const accessToken = tokenResp.access_token;
-  Keychain.set(PCC_REFRESH_KEY, tokenResp.refresh_token); // rotate
-
-  // 3. Get clientId
-  const loginResp = await httpPost(
-    API_BASE + '/auth/v2/login',
-    Object.assign(getBaseHeaders(accessToken), { 'X-User-Authorization-V2': 'Bearer ' + accessToken }),
-    { language: 0 }
-  );
-  const clientId = loginResp.clientId;
-
-  // 4. Resolve device GUID
-  let guid = DEVICE_GUID;
-  if (!guid) {
-    const groupsResp = await httpGet(
-      API_BASE + '/device/group/',
-      Object.assign(getBaseHeaders(accessToken), {
-        'X-Client-Id': clientId,
-        'X-User-Authorization-V2': 'Bearer ' + accessToken
-      })
-    );
-    const groups = groupsResp.groupList || [];
-    if (!groups.length || !groups[0].deviceList || !groups[0].deviceList.length) {
-      notify('Panasonic AC', 'No devices found in account');
-      return;
+    const parsed = JSON.parse(Keychain.get(TRANSITION_KEY));
+    // Old shape was a single transition object (had `plan` key) or null
+    if (parsed === null || (typeof parsed === 'object' && 'plan' in parsed)) {
+      return {}; // discard legacy single-device state
     }
-    guid = groups[0].deviceList[0].deviceGuid;
-  }
+    return typeof parsed === 'object' ? parsed : {};
+  } catch { return {}; }
+}
+function saveTransitions(map) {
+  Keychain.set(TRANSITION_KEY, JSON.stringify(map));
+}
 
-  // 5. Get device state
+// ============================================================
+// Device resolution
+// ============================================================
+function resolveDevices(groupList, configuredGuids) {
+  const allDevices = {};
+  for (const group of groupList) {
+    for (const d of (group.deviceList || [])) {
+      allDevices[d.deviceGuid] = { guid: d.deviceGuid, name: d.deviceName || d.deviceGuid };
+    }
+  }
+  if (configuredGuids.length === 0) return Object.values(allDevices);
+  const result = [];
+  for (const g of configuredGuids) {
+    if (allDevices[g]) {
+      result.push(allDevices[g]);
+    } else {
+      console.log(`WARNING: configured GUID ${g} not found in account — skipping`);
+    }
+  }
+  return result;
+}
+
+// ============================================================
+// Per-device state machine
+// ============================================================
+async function processDevice({ guid, name }, transitions, accessToken, clientId) {
   const deviceResp = await httpGet(
     API_BASE + '/deviceStatus/' + guid,
     Object.assign(getBaseHeaders(accessToken), {
@@ -373,14 +331,9 @@ async function main() {
   const setTemp  = p.temperatureSet;
   const fanSpeed = p.fanSpeed;
   const ecoMode  = p.ecoMode;
-  console.log(`State: inside=${inside}C operate=${operate} mode=${mode} setTemp=${setTemp} fan=${fanSpeed} eco=${ecoMode}`);
+  console.log(`[${name}] State: inside=${inside}C operate=${operate} mode=${mode} setTemp=${setTemp} fan=${fanSpeed} eco=${ecoMode}`);
 
-  // 6. State machine decision — decide ONLY (no persistence yet)
-  // Persistence intent:
-  //   stateToPersist  = object to save in Keychain after successful apply
-  //   clearAfterApply = true → wipe Keychain after successful apply
-  //   immediateClear  = true → wipe Keychain NOW (abort cases, no apply needed)
-  let active = loadTransition();
+  let active = transitions[guid] ?? null;
   let actionTaken = 'none';
   let applyParams = null;
   let stateToPersist = null;
@@ -430,15 +383,15 @@ async function main() {
     }
   }
 
-  // 7. Immediate clear for abort cases (no apply needed)
-  if (immediateClear) clearTransition();
+  // Immediate clear for abort cases (no apply needed)
+  if (immediateClear) transitions[guid] = null;
 
-  // 8. Apply parameters (if any). On throw, state is NOT advanced → step retries next run.
+  // Apply parameters (if any). On throw, state is NOT advanced → step retries next run.
   let applySucceeded = false;
   if (applyParams) {
     if (DRY_RUN) {
-      console.log(`[DRY_RUN] would setParameters: ${JSON.stringify(applyParams)}`);
-      applySucceeded = true; // DRY_RUN persists state so flow can be observed across runs
+      console.log(`[${name}] [DRY_RUN] would setParameters: ${JSON.stringify(applyParams)}`);
+      applySucceeded = true;
     } else {
       const ctrlResp = await httpPost(
         API_BASE + '/deviceStatus/control',
@@ -448,19 +401,119 @@ async function main() {
         }),
         { deviceGuid: guid, parameters: applyParams }
       );
-      console.log(`setParameters response: ${JSON.stringify(ctrlResp)}`);
+      console.log(`[${name}] setParameters response: ${JSON.stringify(ctrlResp)}`);
       applySucceeded = true;
     }
   }
 
-  // 9. Persist state — only after a successful apply
+  // Persist state — only after successful apply
   if (applySucceeded) {
-    if (clearAfterApply) clearTransition();
-    else if (stateToPersist) saveTransition(stateToPersist);
+    if (clearAfterApply) transitions[guid] = null;
+    else if (stateToPersist) transitions[guid] = stateToPersist;
   }
 
-  console.log('Action: ' + actionTaken);
-  notify('Panasonic AC', `${actionTaken}${DRY_RUN ? ' [DRY_RUN]' : ''}`);
+  console.log(`[${name}] Action: ` + actionTaken);
+  return actionTaken;
+}
+
+// ============================================================
+// Main flow
+// ============================================================
+async function fetchCurrentAppVersion() {
+  if (APP_VERSION_OVERRIDE) return APP_VERSION_OVERRIDE;
+  try {
+    const req = new Request('https://itunes.apple.com/lookup?id=1348640525');
+    req.method = 'GET';
+    const data = await req.loadJSON();
+    return data?.results?.[0]?.version || APP_VERSION_FALLBACK;
+  } catch (e) {
+    console.log('iTunes lookup failed, using fallback: ' + e.message);
+    return APP_VERSION_FALLBACK;
+  }
+}
+
+async function main() {
+  // 0. Resolve current X-APP-VERSION
+  APP_VERSION = await fetchCurrentAppVersion();
+  console.log('X-APP-VERSION = ' + APP_VERSION);
+
+  // 1. Load refresh token from Keychain
+  const rt = Keychain.contains(PCC_REFRESH_KEY) ? Keychain.get(PCC_REFRESH_KEY) : null;
+  if (!rt) {
+    notify('Panasonic AC', 'No refresh token — run seed on Mac then Keychain.set once');
+    return;
+  }
+
+  // 2. Refresh OAuth token
+  let tokenResp;
+  try {
+    tokenResp = await httpPost(
+      AUTH_BASE + '/oauth/token',
+      {
+        'Auth0-Client': AUTH0_CLIENT,
+        'Content-Type': 'application/json',
+        'User-Agent': 'okhttp/4.10.0'
+      },
+      {
+        scope: 'openid offline_access comfortcloud.control a2w.control',
+        client_id: CLIENT_ID,
+        refresh_token: rt,
+        grant_type: 'refresh_token'
+      }
+    );
+  } catch (e) {
+    notify('Panasonic AC', 'Token refresh failed — re-seed refresh token');
+    return;
+  }
+  const accessToken = tokenResp.access_token;
+  Keychain.set(PCC_REFRESH_KEY, tokenResp.refresh_token); // rotate
+
+  // 3. Get clientId
+  const loginResp = await httpPost(
+    API_BASE + '/auth/v2/login',
+    Object.assign(getBaseHeaders(accessToken), { 'X-User-Authorization-V2': 'Bearer ' + accessToken }),
+    { language: 0 }
+  );
+  const clientId = loginResp.clientId;
+
+  // 4. Resolve devices from groups (call once)
+  const groupsResp = await httpGet(
+    API_BASE + '/device/group/',
+    Object.assign(getBaseHeaders(accessToken), {
+      'X-Client-Id': clientId,
+      'X-User-Authorization-V2': 'Bearer ' + accessToken
+    })
+  );
+  const groupList = groupsResp.groupList || [];
+  const configuredGuids = DEVICE_GUIDS.split(',').map(s => s.trim()).filter(Boolean);
+  const devices = resolveDevices(groupList, configuredGuids);
+
+  if (!devices.length) {
+    notify('Panasonic AC', 'No devices resolved — check account or DEVICE_GUIDS');
+    return;
+  }
+  console.log('Devices: ' + devices.map(d => d.name + ' (' + d.guid + ')').join(', '));
+
+  // 5. Load transitions map (shared across all devices this run)
+  const transitions = loadTransitions();
+
+  // 6. Per-device loop (serial)
+  for (const device of devices) {
+    try {
+      const actionTaken = await processDevice(device, transitions, accessToken, clientId);
+      const isIdle = actionTaken === 'none' || actionTaken === 'idle (not in COOL mode)' ||
+        actionTaken.startsWith('transition active, no step due yet');
+      if (!isIdle) {
+        notify(`Panasonic AC ${device.name}`, actionTaken + (DRY_RUN ? ' [DRY_RUN]' : ''));
+      }
+    } catch (e) {
+      console.log(`[${device.name}] Error: ` + e.message);
+      notify(`Panasonic AC ${device.name} ERROR`, e.message || String(e));
+    }
+  }
+
+  // 7. ALWAYS save transitions map (even if all idle — token rotation handled separately via Keychain.set above)
+  saveTransitions(transitions);
 }
 
 // ============================================================

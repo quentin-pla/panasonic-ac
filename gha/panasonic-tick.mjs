@@ -4,7 +4,7 @@
 //
 // Env vars:
 //   PCC_REFRESH      initial refresh token (bootstrap when state file missing)
-//   PCC_DEVICE_GUID  optional — empty/missing => auto-pick first device
+//   PCC_DEVICE_GUID  comma-separated GUIDs (empty/missing => auto-pick ALL devices)
 //   PCC_DRY_RUN      'true' => only log, never call setParameters
 //   PCC_APP_VERSION  optional pin — empty => fetch from iTunes Lookup
 //   NTFY_TOPIC       ntfy.sh topic (empty => no push notifications)
@@ -17,7 +17,7 @@ import path from 'node:path'
 // ============================================================
 // CONFIG
 // ============================================================
-const DEVICE_GUID         = process.env.PCC_DEVICE_GUID || ''
+const DEVICE_GUIDS_ENV     = process.env.PCC_DEVICE_GUID || ''
 const DRY_RUN             = process.env.PCC_DRY_RUN === 'true'
 const DRY_TARGET_TEMP     = 20
 const STEP_INTERVALS_SEC  = { 5: 180, 4: 300, 3: 600, 2: 600, 1: 600 }
@@ -112,12 +112,20 @@ async function fetchAppVersion() {
 // ============================================================
 async function loadState() {
   try {
-    return JSON.parse(await fs.readFile(STATE_FILE, 'utf8'))
+    const raw = JSON.parse(await fs.readFile(STATE_FILE, 'utf8'))
+    // Migration: old shape had `transition` (single-device) → drop, init transitions map
+    if ('transition' in raw && !('transitions' in raw)) {
+      raw.transitions = {}
+      delete raw.transition
+    } else if (!('transitions' in raw)) {
+      raw.transitions = {}
+    }
+    return raw
   } catch (e) {
     if (e.code !== 'ENOENT') throw e
     const seed = process.env.PCC_REFRESH
     if (!seed) throw new Error('No state file and PCC_REFRESH env not set — cannot bootstrap')
-    return { refreshToken: seed, transition: null }
+    return { refreshToken: seed, transitions: {} }
   }
 }
 async function saveState(state) {
@@ -171,6 +179,118 @@ function buildTransitionPlan(currentFanSpeed, currentEcoMode) {
 }
 
 // ============================================================
+// Device resolution
+// ============================================================
+function resolveDevices(groupList, configuredGuids) {
+  // Build flat map guid → { guid, name }
+  const allDevices = {}
+  for (const group of groupList) {
+    for (const d of (group.deviceList || [])) {
+      allDevices[d.deviceGuid] = { guid: d.deviceGuid, name: d.deviceName || d.deviceGuid }
+    }
+  }
+
+  if (configuredGuids.length === 0) {
+    // Auto: all devices
+    return Object.values(allDevices)
+  }
+
+  const result = []
+  for (const g of configuredGuids) {
+    if (allDevices[g]) {
+      result.push(allDevices[g])
+    } else {
+      console.log(`WARNING: configured GUID ${g} not found in account — skipping`)
+    }
+  }
+  return result
+}
+
+// ============================================================
+// Per-device state machine
+// ============================================================
+async function processDevice({ guid, name }, state, accessToken, clientId) {
+  const deviceResp = await httpJson(`${API_BASE}/deviceStatus/${guid}`, {
+    headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
+  })
+  const p = deviceResp.parameters
+  console.log(`[${name}] State: inside=${p.insideTemperature}C operate=${p.operate} mode=${p.operationMode} setTemp=${p.temperatureSet} fan=${p.fanSpeed} eco=${p.ecoMode}`)
+
+  let active = state.transitions[guid] ?? null
+  let actionTaken = 'none'
+  let applyParams = null
+  let stateToPersist = null
+  let clearAfterApply = false
+  let immediateClear = false
+
+  if (active) {
+    if (p.operate === POWER_OFF) {
+      immediateClear = true
+      actionTaken = 'aborted (powered off)'
+    } else if (p.operationMode !== MODE_DRY || Math.abs(p.temperatureSet - DRY_TARGET_TEMP) > 0.5) {
+      immediateClear = true
+      actionTaken = `aborted (user changed mode=${p.operationMode} setTemp=${p.temperatureSet})`
+    } else {
+      const elapsedSec = Math.floor((Date.now() - active.startMs) / 1000)
+      let nextIdx = active.lastAppliedIdx
+      for (let i = active.lastAppliedIdx + 1; i < active.plan.length; i++) {
+        if (active.plan[i].atSec <= elapsedSec) nextIdx = i
+        else break
+      }
+      if (nextIdx > active.lastAppliedIdx) {
+        applyParams = active.plan[nextIdx].params
+        active.lastAppliedIdx = nextIdx
+        if (nextIdx >= active.plan.length - 1) {
+          clearAfterApply = true
+          actionTaken = `final step ${nextIdx}/${active.plan.length - 1}: ${JSON.stringify(applyParams)}`
+        } else {
+          stateToPersist = active
+          actionTaken = `step ${nextIdx}/${active.plan.length - 1}: ${JSON.stringify(applyParams)}`
+        }
+      } else {
+        const nextStep = active.plan[active.lastAppliedIdx + 1]
+        actionTaken = `transition active, no step due yet (elapsed=${elapsedSec}s, next at ${nextStep ? nextStep.atSec + 's' : 'n/a'})`
+      }
+    }
+  } else {
+    if (p.operate === POWER_ON && p.operationMode === MODE_COOL) {
+      const plan = buildTransitionPlan(p.fanSpeed, p.ecoMode)
+      stateToPersist = { startMs: Date.now(), plan, lastAppliedIdx: 0, deviceGuid: guid }
+      applyParams = plan[0].params
+      actionTaken = `started transition (initial fan=${plan[0].params.fanSpeed}, ${plan.length} steps, total ${plan[plan.length - 1].atSec}s)`
+    } else {
+      actionTaken = 'idle (not in COOL mode)'
+    }
+  }
+
+  if (immediateClear) state.transitions[guid] = null
+
+  let applySucceeded = false
+  if (applyParams) {
+    if (DRY_RUN) {
+      console.log(`[${name}] [DRY_RUN] would setParameters: ${JSON.stringify(applyParams)}`)
+      applySucceeded = true
+    } else {
+      const ctrlResp = await httpJson(`${API_BASE}/deviceStatus/control`, {
+        method: 'POST',
+        headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken },
+        body: { deviceGuid: guid, parameters: applyParams }
+      })
+      console.log(`[${name}] setParameters response: ${JSON.stringify(ctrlResp)}`)
+      applySucceeded = true
+    }
+  }
+
+  if (applySucceeded) {
+    if (clearAfterApply) state.transitions[guid] = null
+    else if (stateToPersist) state.transitions[guid] = stateToPersist
+  }
+
+  console.log(`[${name}] Action:`, actionTaken)
+  return actionTaken
+}
+
+// ============================================================
 // Main
 // ============================================================
 async function main() {
@@ -180,7 +300,7 @@ async function main() {
   APP_VERSION = await fetchAppVersion()
   console.log('X-APP-VERSION =', APP_VERSION)
 
-  // 1. Refresh OAuth token (same POST as Scriptable)
+  // 1. Refresh OAuth token
   const tokenResp = await httpJson(`${AUTH_BASE}/oauth/token`, {
     method: 'POST',
     headers: {
@@ -206,111 +326,45 @@ async function main() {
   })
   const clientId = loginResp.clientId
 
-  // 3. Resolve device GUID
-  let guid = DEVICE_GUID
-  if (!guid) {
-    const groupsResp = await httpJson(`${API_BASE}/device/group/`, {
-      headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
-    })
-    const groups = groupsResp.groupList || []
-    if (!groups.length || !groups[0].deviceList || !groups[0].deviceList.length) {
-      throw new Error('No devices found in account')
-    }
-    guid = groups[0].deviceList[0].deviceGuid
-  }
-
-  // 4. Get device state
-  const deviceResp = await httpJson(`${API_BASE}/deviceStatus/${guid}`, {
+  // 3. Resolve devices from groups (call once)
+  const groupsResp = await httpJson(`${API_BASE}/device/group/`, {
     headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
   })
-  const p = deviceResp.parameters
-  console.log(`State: inside=${p.insideTemperature}C operate=${p.operate} mode=${p.operationMode} setTemp=${p.temperatureSet} fan=${p.fanSpeed} eco=${p.ecoMode}`)
+  const groupList = groupsResp.groupList || []
+  const configuredGuids = DEVICE_GUIDS_ENV.split(',').map(s => s.trim()).filter(Boolean)
+  const devices = resolveDevices(groupList, configuredGuids)
 
-  // 5. State machine — verbatim port from Scriptable
-  let applyError = null
-  try {
-    let active = state.transition
-    let actionTaken = 'none'
-    let applyParams = null
-    let stateToPersist = null
-    let clearAfterApply = false
-    let immediateClear = false
+  if (!devices.length) throw new Error('No devices resolved — check account or PCC_DEVICE_GUID')
+  console.log('Devices:', devices.map(d => `${d.name} (${d.guid})`).join(', '))
 
-    if (active) {
-      if (p.operate === POWER_OFF) {
-        immediateClear = true
-        actionTaken = 'aborted (powered off)'
-      } else if (p.operationMode !== MODE_DRY || Math.abs(p.temperatureSet - DRY_TARGET_TEMP) > 0.5) {
-        immediateClear = true
-        actionTaken = `aborted (user changed mode=${p.operationMode} setTemp=${p.temperatureSet})`
-      } else {
-        const elapsedSec = Math.floor((Date.now() - active.startMs) / 1000)
-        let nextIdx = active.lastAppliedIdx
-        for (let i = active.lastAppliedIdx + 1; i < active.plan.length; i++) {
-          if (active.plan[i].atSec <= elapsedSec) nextIdx = i
-          else break
-        }
-        if (nextIdx > active.lastAppliedIdx) {
-          applyParams = active.plan[nextIdx].params
-          active.lastAppliedIdx = nextIdx
-          if (nextIdx >= active.plan.length - 1) {
-            clearAfterApply = true
-            actionTaken = `final step ${nextIdx}/${active.plan.length - 1}: ${JSON.stringify(applyParams)}`
-          } else {
-            stateToPersist = active
-            actionTaken = `step ${nextIdx}/${active.plan.length - 1}: ${JSON.stringify(applyParams)}`
-          }
-        } else {
-          const nextStep = active.plan[active.lastAppliedIdx + 1]
-          actionTaken = `transition active, no step due yet (elapsed=${elapsedSec}s, next at ${nextStep ? nextStep.atSec + 's' : 'n/a'})`
-        }
+  // 4. Per-device loop (serial)
+  let anyDeviceErrored = false
+  const notifyActions = [] // collect non-idle actions for notification
+
+  for (const device of devices) {
+    try {
+      const actionTaken = await processDevice(device, state, accessToken, clientId)
+      const isIdle = actionTaken === 'none' || actionTaken === 'idle (not in COOL mode)' ||
+        actionTaken.startsWith('transition active, no step due yet')
+      if (!isIdle) {
+        notifyActions.push({ name: device.name, action: actionTaken })
+        await ntfy(
+          `Panasonic AC ${device.name}`,
+          actionTaken + (DRY_RUN ? ' [DRY_RUN]' : '')
+        )
       }
-    } else {
-      if (p.operate === POWER_ON && p.operationMode === MODE_COOL) {
-        const plan = buildTransitionPlan(p.fanSpeed, p.ecoMode)
-        stateToPersist = { startMs: Date.now(), plan, lastAppliedIdx: 0, deviceGuid: guid }
-        applyParams = plan[0].params
-        actionTaken = `started transition (initial fan=${plan[0].params.fanSpeed}, ${plan.length} steps, total ${plan[plan.length - 1].atSec}s)`
-      } else {
-        actionTaken = 'idle (not in COOL mode)'
-      }
+    } catch (e) {
+      console.error(`[${device.name}] Error:`, e?.stack || e)
+      anyDeviceErrored = true
+      await ntfy(`Panasonic AC ${device.name} ERROR`, e?.message || String(e), 'high')
     }
-
-    if (immediateClear) state.transition = null
-
-    let applySucceeded = false
-    if (applyParams) {
-      if (DRY_RUN) {
-        console.log(`[DRY_RUN] would setParameters: ${JSON.stringify(applyParams)}`)
-        applySucceeded = true
-      } else {
-        const ctrlResp = await httpJson(`${API_BASE}/deviceStatus/control`, {
-          method: 'POST',
-          headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken },
-          body: { deviceGuid: guid, parameters: applyParams }
-        })
-        console.log(`setParameters response: ${JSON.stringify(ctrlResp)}`)
-        applySucceeded = true
-      }
-    }
-
-    if (applySucceeded) {
-      if (clearAfterApply) state.transition = null
-      else if (stateToPersist) state.transition = stateToPersist
-    }
-
-    console.log('Action:', actionTaken)
-    await ntfy('Panasonic AC', actionTaken + (DRY_RUN ? ' [DRY_RUN]' : ''))
-  } catch (e) {
-    applyError = e
   }
 
-  // ALWAYS save — rotated refresh token must persist even on error
+  // 5. ALWAYS save state (rotated token + per-device transitions)
   await saveState(state)
 
-  if (applyError) {
-    await ntfy('Panasonic AC error', applyError.message || String(applyError), 'high')
-    throw applyError
+  if (anyDeviceErrored) {
+    throw new Error('One or more devices failed — see logs above')
   }
 }
 

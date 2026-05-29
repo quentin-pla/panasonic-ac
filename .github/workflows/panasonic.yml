@@ -17,12 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      # actions/cache@v4 = restore on entry + save in post-step.
+      # actions/cache@v5 = restore on entry + save in post-step.
       # github.run_id is unique → exact key never pre-exists → cache always saves.
       # restore-keys falls back to latest pcc-state-* on cold start.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: state
           key: pcc-state-${{ github.run_id }}

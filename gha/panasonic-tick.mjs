@@ -346,7 +346,8 @@ async function main() {
       const actionTaken = await processDevice(device, state, accessToken, clientId)
       const isIdle = actionTaken === 'none' || actionTaken === 'idle (not in COOL mode)' ||
         actionTaken.startsWith('transition active, no step due yet')
-      if (!isIdle) {
+      // DRY_RUN: always notify to confirm pipeline reach. Production: skip idle to avoid spam.
+      if (!isIdle || DRY_RUN) {
         notifyActions.push({ name: device.name, action: actionTaken })
         await ntfy(
           `Panasonic AC ${device.name}`,

@@ -503,7 +503,8 @@ async function main() {
       const actionTaken = await processDevice(device, transitions, accessToken, clientId);
       const isIdle = actionTaken === 'none' || actionTaken === 'idle (not in COOL mode)' ||
         actionTaken.startsWith('transition active, no step due yet');
-      if (!isIdle) {
+      // DRY_RUN: always notify to confirm script ran. Production: skip idle to avoid spam.
+      if (!isIdle || DRY_RUN) {
         notify(`Panasonic AC ${device.name}`, actionTaken + (DRY_RUN ? ' [DRY_RUN]' : ''));
       }
     } catch (e) {

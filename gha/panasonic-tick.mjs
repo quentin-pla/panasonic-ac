@@ -1,4 +1,16 @@
-import { ComfortCloudClient, OperationMode, FanSpeed, EcoMode, Power } from 'panasonic-comfort-cloud-client'
+// Panasonic AC tick — Node port of scriptable/panasonic-comfort.js.
+// Uses raw fetch + native crypto. No third-party Panasonic lib (avoids stale
+// hardcoded appVersion). State machine logic IDENTICAL to Scriptable.
+//
+// Env vars:
+//   PCC_REFRESH      initial refresh token (bootstrap when state file missing)
+//   PCC_DEVICE_GUID  optional — empty/missing => auto-pick first device
+//   PCC_DRY_RUN      'true' => only log, never call setParameters
+//   PCC_APP_VERSION  optional pin — empty => fetch from iTunes Lookup
+//   NTFY_TOPIC       ntfy.sh topic (empty => no push notifications)
+//   NTFY_BASE        default https://ntfy.sh
+
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -15,29 +27,73 @@ const NTFY_BASE           = process.env.NTFY_BASE || 'https://ntfy.sh'
 const APP_VERSION_OVERRIDE = process.env.PCC_APP_VERSION || ''
 const APP_VERSION_FALLBACK = '4.3.0'
 
+// Enums (mirror lib enums for readability — store numbers in JSON)
+const MODE_DRY = 1, MODE_COOL = 2
+const ECO_AUTO = 0, ECO_POWERFUL = 1, ECO_QUIET = 2
+const POWER_OFF = 0, POWER_ON = 1
+
 // ============================================================
-// State helpers
+// API constants
 // ============================================================
-async function loadState() {
-  try {
-    const raw = await fs.readFile(STATE_FILE, 'utf8')
-    return JSON.parse(raw)
-  } catch (e) {
-    if (e.code !== 'ENOENT') throw e
-    // File missing — bootstrap from env seed
-    const seed = process.env.PCC_REFRESH
-    if (!seed) throw new Error('No state file and PCC_REFRESH env not set — cannot bootstrap')
-    return { refreshToken: seed, transition: null }
+const API_BASE    = 'https://accsmart.panasonic.com'
+const AUTH_BASE   = 'https://authglb.digital.panasonic.com'
+const CLIENT_ID   = 'Xmy6xIYIitMxngjB2rHvlm6HSDNnaMJx'
+const AUTH0_CLIENT= 'eyJuYW1lIjoiQXV0aDAuQW5kcm9pZCIsImVudiI6eyJhbmRyb2lkIjoiMzAifSwidmVyc2lvbiI6IjIuOS4zIn0='
+const FIXED_KEY   = '521325fb2dd486bf4831b47644317fca'
+const CC_NAME     = 'Comfort Cloud'
+
+let APP_VERSION = APP_VERSION_OVERRIDE || APP_VERSION_FALLBACK
+
+// ============================================================
+// CFC key (port of Scriptable computeCfcKey)
+// ============================================================
+function pad2(n) { return String(n).padStart(2, '0') }
+function getTimestamp() {
+  const d = new Date()
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+}
+function computeCfcKey(timestamp, accessToken) {
+  const timeDiff = Date.parse(timestamp.replace(' ', 'T') + 'Z')
+  const enc = (s) => Buffer.from(s, 'utf8')
+  const bytes = Buffer.concat([
+    enc(CC_NAME), enc(FIXED_KEY), enc(String(timeDiff)), enc('Bearer '), enc(accessToken)
+  ])
+  const hash = createHash('sha256').update(bytes).digest('hex')
+  return hash.slice(0, 9) + 'cfc' + hash.slice(9)
+}
+function getBaseHeaders(accessToken) {
+  const timestamp = getTimestamp()
+  return {
+    'Accept': 'application/json; charset=UTF-8',
+    'Content-Type': 'application/json',
+    'User-Agent': 'G-RAC',
+    'X-APP-NAME': 'Comfort Cloud',
+    'X-APP-TIMESTAMP': timestamp,
+    'X-APP-TYPE': '1',
+    'X-APP-VERSION': APP_VERSION,
+    'X-CFC-API-KEY': computeCfcKey(timestamp, accessToken)
   }
 }
 
-async function saveState(state) {
-  await fs.mkdir(path.dirname(STATE_FILE), { recursive: true })
-  await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8')
+// ============================================================
+// HTTP helpers
+// ============================================================
+async function httpJson(url, { method = 'GET', headers = {}, body = null } = {}) {
+  const init = { method, headers }
+  if (body !== null) init.body = typeof body === 'string' ? body : JSON.stringify(body)
+  const res = await fetch(url, init)
+  const text = await res.text()
+  let data = null
+  try { data = text ? JSON.parse(text) : null } catch { data = text }
+  if (!res.ok) {
+    console.log(`${method} ${url} -> ${res.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`)
+    throw new Error(`HTTP ${res.status} from ${url}`)
+  }
+  return data
 }
 
 // ============================================================
-// App version
+// App version (iTunes Lookup, like iobroker)
 // ============================================================
 async function fetchAppVersion() {
   if (APP_VERSION_OVERRIDE) return APP_VERSION_OVERRIDE
@@ -52,7 +108,25 @@ async function fetchAppVersion() {
 }
 
 // ============================================================
-// Notifications
+// State helpers
+// ============================================================
+async function loadState() {
+  try {
+    return JSON.parse(await fs.readFile(STATE_FILE, 'utf8'))
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e
+    const seed = process.env.PCC_REFRESH
+    if (!seed) throw new Error('No state file and PCC_REFRESH env not set — cannot bootstrap')
+    return { refreshToken: seed, transition: null }
+  }
+}
+async function saveState(state) {
+  await fs.mkdir(path.dirname(STATE_FILE), { recursive: true })
+  await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8')
+}
+
+// ============================================================
+// Notifications (ntfy.sh)
 // ============================================================
 async function ntfy(title, body, priority = 'default') {
   if (!NTFY_TOPIC) return
@@ -66,39 +140,33 @@ async function ntfy(title, body, priority = 'default') {
 }
 
 // ============================================================
-// Transition plan builder — identical logic to Scriptable
-// Enums are numeric: FanSpeed.High=5, EcoMode.Powerful=1, etc.
-// Store numbers in params so JSON serializes cleanly.
+// Transition plan (identical to Scriptable)
 // ============================================================
 function buildTransitionPlan(currentFanSpeed, currentEcoMode) {
   let start
-  if (currentEcoMode === EcoMode.Powerful) start = 5
+  if (currentEcoMode === ECO_POWERFUL) start = 5
   else if (currentFanSpeed >= 1 && currentFanSpeed <= 5) start = currentFanSpeed
   else start = 3
 
   const plan = []
-  // Step 0: switch to DRY @ 20°C, clear Powerful, set starting fan
   plan.push({
     atSec: 0,
     params: {
-      operate: Power.On,
-      operationMode: OperationMode.Dry,
+      operate: POWER_ON,
+      operationMode: MODE_DRY,
       temperatureSet: DRY_TARGET_TEMP,
       fanSpeed: start,
-      ecoMode: EcoMode.Auto
+      ecoMode: ECO_AUTO
     }
   })
-
   let t = 0, fs = start
   while (fs > 1) {
     t += STEP_INTERVALS_SEC[fs]
     fs -= 1
     plan.push({ atSec: t, params: { fanSpeed: fs } })
   }
-  // Final: after the 1 interval, set Quiet (keep fan at 1)
   t += STEP_INTERVALS_SEC[1]
-  plan.push({ atSec: t, params: { ecoMode: EcoMode.Quiet } })
-
+  plan.push({ atSec: t, params: { ecoMode: ECO_QUIET } })
   return plan
 }
 
@@ -107,50 +175,58 @@ function buildTransitionPlan(currentFanSpeed, currentEcoMode) {
 // ============================================================
 async function main() {
   const state = await loadState()
-  const { refreshToken } = state
-  if (!refreshToken) throw new Error('No refreshToken in state')
+  if (!state.refreshToken) throw new Error('No refreshToken in state')
 
-  const appVersion = await fetchAppVersion()
-  console.log('app version:', appVersion)
+  APP_VERSION = await fetchAppVersion()
+  console.log('X-APP-VERSION =', APP_VERSION)
 
-  const client = new ComfortCloudClient(appVersion)
-  await client.login(undefined, undefined, refreshToken)
+  // 1. Refresh OAuth token (same POST as Scriptable)
+  const tokenResp = await httpJson(`${AUTH_BASE}/oauth/token`, {
+    method: 'POST',
+    headers: {
+      'Auth0-Client': AUTH0_CLIENT,
+      'Content-Type': 'application/json',
+      'User-Agent': 'okhttp/4.10.0'
+    },
+    body: {
+      scope: 'openid offline_access comfortcloud.control a2w.control',
+      client_id: CLIENT_ID,
+      refresh_token: state.refreshToken,
+      grant_type: 'refresh_token'
+    }
+  })
+  const accessToken = tokenResp.access_token
+  state.refreshToken = tokenResp.refresh_token // ROTATE — must persist even if downstream fails
 
-  // Capture rotated token immediately — must persist even on downstream error
-  const newRefresh = client.oauthClient.tokenRefresh
-  state.refreshToken = newRefresh
+  // 2. Get clientId
+  const loginResp = await httpJson(`${API_BASE}/auth/v2/login`, {
+    method: 'POST',
+    headers: { ...getBaseHeaders(accessToken), 'X-User-Authorization-V2': 'Bearer ' + accessToken },
+    body: { language: 0 }
+  })
+  const clientId = loginResp.clientId
 
-  // Resolve device GUID
+  // 3. Resolve device GUID
   let guid = DEVICE_GUID
   if (!guid) {
-    const groups = await client.getGroups()
-    if (!groups.length || !groups[0].devices || !groups[0].devices.length) {
+    const groupsResp = await httpJson(`${API_BASE}/device/group/`, {
+      headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
+    })
+    const groups = groupsResp.groupList || []
+    if (!groups.length || !groups[0].deviceList || !groups[0].deviceList.length) {
       throw new Error('No devices found in account')
     }
-    guid = groups[0].devices[0].guid
+    guid = groups[0].deviceList[0].deviceGuid
   }
 
-  const device = await client.getDevice(guid)
-  if (!device) throw new Error(`getDevice returned null for guid=${guid}`)
+  // 4. Get device state
+  const deviceResp = await httpJson(`${API_BASE}/deviceStatus/${guid}`, {
+    headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
+  })
+  const p = deviceResp.parameters
+  console.log(`State: inside=${p.insideTemperature}C operate=${p.operate} mode=${p.operationMode} setTemp=${p.temperatureSet} fan=${p.fanSpeed} eco=${p.ecoMode}`)
 
-  const p = {
-    inside:    device.insideTemperature,
-    operate:   device.operate,
-    mode:      device.operationMode,
-    setTemp:   device.temperatureSet,
-    fanSpeed:  device.fanSpeed,
-    ecoMode:   device.ecoMode
-  }
-  console.log(`State: inside=${p.inside}C operate=${p.operate} mode=${p.mode} setTemp=${p.setTemp} fan=${p.fanSpeed} eco=${p.ecoMode}`)
-
-  // ============================================================
-  // State machine — verbatim port from Scriptable lines 378-464
-  // loadTransition()   → state.transition
-  // saveTransition(t)  → state.transition = t
-  // clearTransition()  → state.transition = null
-  // httpPost setParameters → await client.setParameters(guid, applyParams)
-  // notify() → await ntfy()
-  // ============================================================
+  // 5. State machine — verbatim port from Scriptable
   let applyError = null
   try {
     let active = state.transition
@@ -161,15 +237,13 @@ async function main() {
     let immediateClear = false
 
     if (active) {
-      // SAFETY: detect manual intervention → abort transition immediately
-      if (p.operate === Power.Off) {
+      if (p.operate === POWER_OFF) {
         immediateClear = true
         actionTaken = 'aborted (powered off)'
-      } else if (p.mode !== OperationMode.Dry || Math.abs(p.setTemp - DRY_TARGET_TEMP) > 0.5) {
+      } else if (p.operationMode !== MODE_DRY || Math.abs(p.temperatureSet - DRY_TARGET_TEMP) > 0.5) {
         immediateClear = true
-        actionTaken = `aborted (user changed mode=${p.mode} setTemp=${p.setTemp})`
+        actionTaken = `aborted (user changed mode=${p.operationMode} setTemp=${p.temperatureSet})`
       } else {
-        // Find latest plan step due now (atSec ≤ elapsed, idx > lastAppliedIdx)
         const elapsedSec = Math.floor((Date.now() - active.startMs) / 1000)
         let nextIdx = active.lastAppliedIdx
         for (let i = active.lastAppliedIdx + 1; i < active.plan.length; i++) {
@@ -192,8 +266,7 @@ async function main() {
         }
       }
     } else {
-      // No active transition — start one IFF device currently in COOL mode and on
-      if (p.operate === Power.On && p.mode === OperationMode.Cool) {
+      if (p.operate === POWER_ON && p.operationMode === MODE_COOL) {
         const plan = buildTransitionPlan(p.fanSpeed, p.ecoMode)
         stateToPersist = { startMs: Date.now(), plan, lastAppliedIdx: 0, deviceGuid: guid }
         applyParams = plan[0].params
@@ -203,23 +276,24 @@ async function main() {
       }
     }
 
-    // Immediate clear for abort cases (no apply needed)
     if (immediateClear) state.transition = null
 
-    // Apply parameters (if any). On throw, state is NOT advanced → step retries next run.
     let applySucceeded = false
     if (applyParams) {
       if (DRY_RUN) {
         console.log(`[DRY_RUN] would setParameters: ${JSON.stringify(applyParams)}`)
         applySucceeded = true
       } else {
-        const ctrlResp = await client.setParameters(guid, applyParams)
-        console.log(`setParameters response: ${JSON.stringify(ctrlResp?.data)}`)
+        const ctrlResp = await httpJson(`${API_BASE}/deviceStatus/control`, {
+          method: 'POST',
+          headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken },
+          body: { deviceGuid: guid, parameters: applyParams }
+        })
+        console.log(`setParameters response: ${JSON.stringify(ctrlResp)}`)
         applySucceeded = true
       }
     }
 
-    // Persist state — only after a successful apply
     if (applySucceeded) {
       if (clearAfterApply) state.transition = null
       else if (stateToPersist) state.transition = stateToPersist
@@ -231,7 +305,7 @@ async function main() {
     applyError = e
   }
 
-  // Always save — rotated token must be persisted even on error
+  // ALWAYS save — rotated refresh token must persist even on error
   await saveState(state)
 
   if (applyError) {
@@ -240,7 +314,7 @@ async function main() {
   }
 }
 
-main().catch(async e => {
+main().catch(async (e) => {
   console.error('Fatal:', e?.stack || e)
   try { await ntfy('Panasonic AC FATAL', e?.message || String(e), 'high') } catch {}
   process.exit(1)

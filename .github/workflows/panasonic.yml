@@ -2,7 +2,7 @@ name: Panasonic AC tick
 
 on:
   schedule:
-    - cron: '2-57/5 * * * *'   # off-peak minutes
+    - cron: '2-57/5 * * * *'   # off-peak minutes (avoid :00 :05 congestion)
   workflow_dispatch:
 
 permissions:
@@ -19,16 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'pnpm'
-
-      - run: pnpm install --frozen-lockfile
 
       - name: Restore state cache
         id: state-cache

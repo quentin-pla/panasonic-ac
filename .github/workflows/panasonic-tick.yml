@@ -1,8 +1,10 @@
 name: Panasonic AC tick
 
 on:
+  # Primary trigger: external cron (cron-job.org) hits workflow_dispatch every 5 min.
+  # GH's native schedule kept as redundancy — concurrency lock dedups if both fire.
   schedule:
-    - cron: '*/5 * * * *'   # every 5 min — doc-blessed syntax (was '2-57/5' but GH never picked it up)
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:

@@ -1,10 +1,8 @@
 name: Panasonic AC tick
 
 on:
-  # Primary trigger: external cron (cron-job.org) hits workflow_dispatch every 5 min.
-  # GH's native schedule kept as redundancy — concurrency lock dedups if both fire.
-  schedule:
-    - cron: '*/5 * * * *'
+  # Triggered externally by cron-job.org via the workflow_dispatch REST API.
+  # GitHub's native schedule was unreliable — disabled here.
   workflow_dispatch:
 
 permissions:

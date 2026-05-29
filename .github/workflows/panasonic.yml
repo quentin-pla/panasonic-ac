@@ -2,7 +2,7 @@ name: Panasonic AC tick
 
 on:
   schedule:
-    - cron: '2-57/5 * * * *'   # off-peak minutes (avoid :00 :05 congestion)
+    - cron: '*/5 * * * *'   # every 5 min — doc-blessed syntax (was '2-57/5' but GH never picked it up)
   workflow_dispatch:
 
 permissions:

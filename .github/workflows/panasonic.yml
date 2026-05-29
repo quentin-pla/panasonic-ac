@@ -1,0 +1,55 @@
+name: Panasonic AC tick
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'   # off-peak minutes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: panasonic-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Restore state cache
+        id: state-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: pcc-state-${{ github.run_id }}
+          restore-keys: |
+            pcc-state-
+
+      - name: Run tick
+        env:
+          PCC_REFRESH:     ${{ secrets.PCC_REFRESH }}
+          PCC_DEVICE_GUID: ${{ vars.PCC_DEVICE_GUID }}
+          NTFY_TOPIC:      ${{ secrets.NTFY_TOPIC }}
+          PCC_DRY_RUN:     ${{ vars.PCC_DRY_RUN }}
+        run: node gha/panasonic-tick.mjs
+
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: pcc-state-${{ github.run_id }}

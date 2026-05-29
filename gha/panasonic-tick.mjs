@@ -223,6 +223,15 @@ async function processDevice({ guid, name }, state, accessToken, clientId) {
   let clearAfterApply = false
   let immediateClear = false
 
+  // Stale-state recovery: active transition exists but AC is back in COOL
+  // (prior DRY_RUN run, transient API failure, or user toggled back).
+  // Discard stale state so we restart fresh THIS tick instead of waiting another cycle.
+  if (active && p.operationMode === MODE_COOL) {
+    state.transitions[guid] = null
+    active = null
+    console.log(`[${name}] discarded stale transition (AC back in COOL) — restarting`)
+  }
+
   if (active) {
     if (p.operate === POWER_OFF) {
       immediateClear = true

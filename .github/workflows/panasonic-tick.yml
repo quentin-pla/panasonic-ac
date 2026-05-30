@@ -34,4 +34,4 @@ jobs:
           PCC_DEVICE_GUID: ${{ vars.PCC_DEVICE_GUID }}
           NTFY_TOPIC:      ${{ secrets.NTFY_TOPIC }}
           PCC_DRY_RUN:     ${{ vars.PCC_DRY_RUN }}
-        run: node gha/panasonic-tick.mjs
+        run: node panasonic-tick.mjs

@@ -19,7 +19,7 @@ import path from 'node:path'
 // ============================================================
 const DEVICE_GUIDS_ENV     = process.env.PCC_DEVICE_GUID || ''
 const DRY_RUN             = process.env.PCC_DRY_RUN === 'true'
-const DRY_TARGET_TEMP     = 20
+const DRY_TARGET_TEMP     = 24
 const STEP_INTERVALS_SEC  = { 5: 180, 4: 300, 3: 600, 2: 600, 1: 600 }
 const STATE_FILE          = path.resolve('./state/pcc.json')
 const NTFY_TOPIC          = process.env.NTFY_TOPIC || ''

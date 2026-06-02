@@ -54,6 +54,8 @@ const CC_NAME     = 'Comfort Cloud'
 
 const SCOPE        = 'openid offline_access comfortcloud.control a2w.control'
 const TOKEN_MARGIN_MS = 600_000 // refresh 10min before expiry (> 5min tick + jitter → never serve a stale token). Token TTL observed = 86400s (24h).
+const DEVICES_TTL_MS  = 86_400_000 // re-fetch device/group/ at most once per 24h — device list is stable
+const APP_VERSION_TTL_MS = 86_400_000 // re-fetch iTunes app version at most once per 24h — bumps every few weeks
 
 let APP_VERSION = APP_VERSION_OVERRIDE || APP_VERSION_FALLBACK
 
@@ -110,15 +112,26 @@ async function httpJson(url, { method = 'GET', headers = {}, body = null } = {})
 // ============================================================
 // App version (iTunes Lookup, like iobroker)
 // ============================================================
-async function fetchAppVersion() {
+async function fetchAppVersion(state) {
   if (APP_VERSION_OVERRIDE) return APP_VERSION_OVERRIDE
+  const ageMs = state.appVersionCachedAt ? Date.now() - state.appVersionCachedAt : Infinity
+  if (state.appVersion && ageMs < APP_VERSION_TTL_MS) {
+    console.log(`X-APP-VERSION: reused cached ${state.appVersion} (age ${Math.round(ageMs / 3_600_000)}h)`)
+    return state.appVersion
+  }
   try {
     const res = await fetch('https://itunes.apple.com/lookup?id=1348640525')
     const data = await res.json()
-    return data?.results?.[0]?.version || APP_VERSION_FALLBACK
+    const v = data?.results?.[0]?.version || APP_VERSION_FALLBACK
+    state.appVersion = v
+    state.appVersionCachedAt = Date.now()
+    console.log(`X-APP-VERSION: fetched ${v} from iTunes (cache ${Math.round(APP_VERSION_TTL_MS / 3_600_000)}h)`)
+    return v
   } catch (e) {
-    console.log('iTunes lookup failed, using fallback:', e.message)
-    return APP_VERSION_FALLBACK
+    // Don't stamp cachedAt → retry iTunes next tick. Fall back to last good, else const.
+    const fallback = state.appVersion || APP_VERSION_FALLBACK
+    console.log('iTunes lookup failed:', e.message, '— using', fallback)
+    return fallback
   }
 }
 
@@ -186,24 +199,65 @@ async function mintAccessToken(state) {
   throw lastErr
 }
 
-// Returns { accessToken, clientId }. Reuses cached token when still valid.
+// Returns { accessToken, clientId }. FAST PATH reuses BOTH cached token + clientId
+// with NO API call. clientId is cached in state on the token's 24h lifecycle and
+// refetched (via loginV2) only when we mint a fresh token or it's missing.
 async function authenticate(state) {
   const cached = cachedAccessToken(state)
+  if (cached && state.clientId) {
+    const leftSec = Math.round((state.accessTokenExpiresAt - Date.now()) / 1000)
+    console.log(`Auth: reused cached access token + clientId (~${leftSec}s left)`)
+    return { accessToken: cached, clientId: state.clientId }
+  }
   if (cached) {
+    // Token still valid by the clock but no cached clientId — fetch it.
+    // If the token is actually dead (401), fall through to mint.
     try {
-      const clientId = await loginV2(cached)
-      const leftSec = Math.round((state.accessTokenExpiresAt - Date.now()) / 1000)
-      console.log(`Auth: reused cached access token (~${leftSec}s left)`)
-      return { accessToken: cached, clientId }
+      state.clientId = await loginV2(cached)
+      console.log('Auth: cached token valid, fetched clientId')
+      return { accessToken: cached, clientId: state.clientId }
     } catch (e) {
-      console.log('Auth: cached token rejected —', e.message, '— re-authenticating')
+      if (e.status !== 401) throw e
+      console.log('Auth: cached token rejected fetching clientId — re-authenticating')
       state.accessToken = null
       state.accessTokenExpiresAt = null
+      state.clientId = null
     }
   }
   const accessToken = await mintAccessToken(state)
-  const clientId = await loginV2(accessToken)
-  return { accessToken, clientId }
+  state.clientId = await loginV2(accessToken)
+  console.log('Auth: minted token + clientId')
+  return { accessToken, clientId: state.clientId }
+}
+
+// Authed headers from the (mutable) auth holder — rebuilt per call so a mid-run
+// re-auth's new token/clientId is picked up on retry.
+function authHeaders(auth) {
+  return {
+    ...getBaseHeaders(auth.accessToken),
+    'X-Client-Id': auth.clientId,
+    'X-User-Authorization-V2': 'Bearer ' + auth.accessToken,
+  }
+}
+
+// Run an authed API call; on 401 (token revoked early — the fast path no longer
+// validates per tick), invalidate the cached token, re-auth once (mints+rotates),
+// update the shared auth holder, and retry. Single retry — a 2nd failure throws.
+// 401 ONLY: a non-auth 403 must NOT trigger a re-auth (wastes a single-use rotation).
+async function authedRequest(state, auth, doReq) {
+  try {
+    return await doReq()
+  } catch (e) {
+    if (e.status !== 401) throw e
+    console.log('Auth: 401 on API call — invalidating cached token + re-authenticating')
+    state.accessToken = null
+    state.accessTokenExpiresAt = null
+    state.clientId = null
+    const fresh = await authenticate(state)
+    auth.accessToken = fresh.accessToken
+    auth.clientId = fresh.clientId
+    return await doReq()
+  }
 }
 
 // ============================================================
@@ -280,38 +334,56 @@ function buildTransitionPlan(currentFanSpeed, currentEcoMode) {
 // ============================================================
 // Device resolution
 // ============================================================
-function resolveDevices(groupList, configuredGuids) {
-  // Build flat map guid → { guid, name }
-  const allDevices = {}
+// Flatten account groups → [{guid, name}] (ALL devices). Cacheable — stable.
+function flattenGroups(groupList) {
+  const all = []
   for (const group of groupList) {
     for (const d of (group.deviceList || [])) {
-      allDevices[d.deviceGuid] = { guid: d.deviceGuid, name: d.deviceName || d.deviceGuid }
+      all.push({ guid: d.deviceGuid, name: d.deviceName || d.deviceGuid })
     }
   }
+  return all
+}
 
-  if (configuredGuids.length === 0) {
-    // Auto: all devices
-    return Object.values(allDevices)
-  }
-
+// Filter the all-device list by configured GUIDs (empty => all). Applied EVERY
+// tick so PCC_DEVICE_GUID changes take effect immediately despite the cache.
+function selectDevices(allDevices, configuredGuids) {
+  if (configuredGuids.length === 0) return allDevices
+  const byGuid = new Map(allDevices.map(d => [d.guid, d]))
   const result = []
   for (const g of configuredGuids) {
-    if (allDevices[g]) {
-      result.push(allDevices[g])
-    } else {
-      console.log(`WARNING: configured GUID ${g} not found in account — skipping`)
-    }
+    const d = byGuid.get(g)
+    if (d) result.push(d)
+    else console.log(`WARNING: configured GUID ${g} not found in account — skipping`)
   }
   return result
+}
+
+// All account devices, cached in state for DEVICES_TTL_MS (survives via Actions
+// cache). Returns { list, fromCache }. forceRefresh bypasses the cache.
+async function getAllDevices(state, auth, forceRefresh = false) {
+  const ageMs = state.allDevicesCachedAt ? Date.now() - state.allDevicesCachedAt : Infinity
+  if (!forceRefresh && state.allDevices?.length && ageMs < DEVICES_TTL_MS) {
+    console.log(`Devices: reused cached list (${state.allDevices.length}, age ${Math.round(ageMs / 3_600_000)}h)`)
+    return { list: state.allDevices, fromCache: true }
+  }
+  const groupsResp = await authedRequest(state, auth, () => httpJson(`${API_BASE}/device/group/`, {
+    headers: authHeaders(auth),
+  }))
+  const list = flattenGroups(groupsResp.groupList || [])
+  state.allDevices = list
+  state.allDevicesCachedAt = Date.now()
+  console.log(`Devices: fetched ${list.length} from device/group/ (cache ${Math.round(DEVICES_TTL_MS / 3_600_000)}h)`)
+  return { list, fromCache: false }
 }
 
 // ============================================================
 // Per-device state machine
 // ============================================================
-async function processDevice({ guid, name }, state, accessToken, clientId) {
-  const deviceResp = await httpJson(`${API_BASE}/deviceStatus/${guid}`, {
-    headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
-  })
+async function processDevice({ guid, name }, state, auth) {
+  const deviceResp = await authedRequest(state, auth, () => httpJson(`${API_BASE}/deviceStatus/${guid}`, {
+    headers: authHeaders(auth),
+  }))
   const p = deviceResp.parameters
   console.log(`[${name}] State: inside=${p.insideTemperature}C operate=${p.operate} mode=${p.operationMode} setTemp=${p.temperatureSet} fan=${p.fanSpeed} eco=${p.ecoMode}`)
 
@@ -388,11 +460,11 @@ async function processDevice({ guid, name }, state, accessToken, clientId) {
       console.log(`[${name}] [DRY_RUN] would setParameters: ${JSON.stringify(applyParams)}`)
       applySucceeded = true
     } else {
-      const ctrlResp = await httpJson(`${API_BASE}/deviceStatus/control`, {
+      const ctrlResp = await authedRequest(state, auth, () => httpJson(`${API_BASE}/deviceStatus/control`, {
         method: 'POST',
-        headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken },
-        body: { deviceGuid: guid, parameters: applyParams }
-      })
+        headers: authHeaders(auth),
+        body: { deviceGuid: guid, parameters: applyParams },
+      }))
       console.log(`[${name}] setParameters response: ${JSON.stringify(ctrlResp)}`)
       applySucceeded = true
     }
@@ -413,56 +485,57 @@ async function processDevice({ guid, name }, state, accessToken, clientId) {
 async function main() {
   const state = await loadState()
   const initialRefresh = state.refreshToken
-
-  APP_VERSION = await fetchAppVersion()
-  console.log('X-APP-VERSION =', APP_VERSION)
-
-  // 1+2. Authenticate (cached token → refresh_token → username/password) + clientId.
-  // state token fields rotate inside — persisted by saveState below even on failure.
-  const { accessToken, clientId } = await authenticate(state)
-
-  // Refresh token rotated? Emit it for the workflow to push into the PCC_REFRESH
-  // secret (durable cold-start seed). Done now — survives a later device-loop failure.
-  if (state.refreshToken && state.refreshToken !== initialRefresh) {
-    await fs.writeFile(REFRESH_OUT_FILE, state.refreshToken, 'utf8')
-    console.log('Refresh token rotated → wrote', path.basename(REFRESH_OUT_FILE), 'for secret writeback')
-  }
-
-  // 3. Resolve devices from groups (call once)
-  const groupsResp = await httpJson(`${API_BASE}/device/group/`, {
-    headers: { ...getBaseHeaders(accessToken), 'X-Client-Id': clientId, 'X-User-Authorization-V2': 'Bearer ' + accessToken }
-  })
-  const groupList = groupsResp.groupList || []
-  const configuredGuids = DEVICE_GUIDS_ENV.split(',').map(s => s.trim()).filter(Boolean)
-  const devices = resolveDevices(groupList, configuredGuids)
-
-  if (!devices.length) throw new Error('No devices resolved — check account or PCC_DEVICE_GUID')
-  console.log('Devices:', devices.map(d => `${d.name} (${d.guid})`).join(', '))
-
-  // 4. Per-device loop (serial)
   let anyDeviceErrored = false
 
-  for (const device of devices) {
-    try {
-      const actionTaken = await processDevice(device, state, accessToken, clientId)
-      const isIdle = actionTaken === 'none' || actionTaken.startsWith('idle') ||
-        actionTaken.startsWith('transition active, no step due yet')
-      // DRY_RUN: always notify to confirm pipeline reach. Production: skip idle to avoid spam.
-      if (!isIdle || DRY_RUN) {
-        await ntfy(
-          `Panasonic AC ${device.name}`,
-          actionTaken + (DRY_RUN ? ' [DRY_RUN]' : '')
-        )
-      }
-    } catch (e) {
-      console.error(`[${device.name}] Error:`, e?.stack || e)
-      anyDeviceErrored = true
-      await ntfy(`Panasonic AC ${device.name} ERROR`, e?.message || String(e), 'high')
-    }
-  }
+  try {
+    APP_VERSION = await fetchAppVersion(state)
+    console.log('X-APP-VERSION =', APP_VERSION)
 
-  // 5. ALWAYS save state (rotated token + per-device transitions)
-  await saveState(state)
+    // 1+2. Authenticate (cached token+clientId fast path → refresh_token grant).
+    // Mutable holder so a mid-run 401 re-auth propagates to every later call.
+    const auth = await authenticate(state)
+
+    // 3. Resolve devices — cached list (≤24h), filtered by PCC_DEVICE_GUID each tick.
+    const configuredGuids = DEVICE_GUIDS_ENV.split(',').map(s => s.trim()).filter(Boolean)
+    const cached = await getAllDevices(state, auth)
+    let devices = selectDevices(cached.list, configuredGuids)
+    if (!devices.length && cached.fromCache) {
+      // Nothing resolved from a cached list — it may be stale; refetch once before giving up.
+      console.log('No devices resolved from cached list — refreshing device/group/')
+      const refetched = await getAllDevices(state, auth, true)
+      devices = selectDevices(refetched.list, configuredGuids)
+    }
+    if (!devices.length) throw new Error('No devices resolved — check account or PCC_DEVICE_GUID')
+    console.log('Devices:', devices.map(d => `${d.name} (${d.guid})`).join(', '))
+
+    // 4. Per-device loop (serial)
+    for (const device of devices) {
+      try {
+        const actionTaken = await processDevice(device, state, auth)
+        const isIdle = actionTaken === 'none' || actionTaken.startsWith('idle') ||
+          actionTaken.startsWith('transition active, no step due yet')
+        // DRY_RUN: always notify to confirm pipeline reach. Production: skip idle to avoid spam.
+        if (!isIdle || DRY_RUN) {
+          await ntfy(
+            `Panasonic AC ${device.name}`,
+            actionTaken + (DRY_RUN ? ' [DRY_RUN]' : '')
+          )
+        }
+      } catch (e) {
+        console.error(`[${device.name}] Error:`, e?.stack || e)
+        anyDeviceErrored = true
+        await ntfy(`Panasonic AC ${device.name} ERROR`, e?.message || String(e), 'high')
+      }
+    }
+  } finally {
+    // 5. ALWAYS persist (rotated token + clientId + transitions) — even on failure
+    // or a mid-loop re-auth. Emit rotated refresh token for the secret writeback.
+    if (state.refreshToken && state.refreshToken !== initialRefresh) {
+      await fs.writeFile(REFRESH_OUT_FILE, state.refreshToken, 'utf8')
+      console.log('Refresh token rotated → wrote', path.basename(REFRESH_OUT_FILE), 'for secret writeback')
+    }
+    await saveState(state)
+  }
 
   if (anyDeviceErrored) {
     throw new Error('One or more devices failed — see logs above')

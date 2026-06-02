@@ -30,8 +30,26 @@ jobs:
 
       - name: Run tick
         env:
+          # PCC_REFRESH (kept fresh by the writeback step below) exclusively.
           PCC_REFRESH:     ${{ secrets.PCC_REFRESH }}
           PCC_DEVICE_GUID: ${{ vars.PCC_DEVICE_GUID }}
           NTFY_TOPIC:      ${{ secrets.NTFY_TOPIC }}
           PCC_DRY_RUN:     ${{ vars.PCC_DRY_RUN }}
         run: node panasonic-tick.mjs
+
+      # Durable refresh token: when the tick rotated it, refresh-token.new exists.
+      # Pipe it into the PCC_REFRESH secret via stdin (never echoed → no log leak).
+      # if: always() so it persists even if the tick failed after rotating.
+      # Needs GH_PAT = fine-grained PAT with "Secrets: Read and write" on this repo.
+      - name: Persist rotated refresh token
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -s refresh-token.new ]; then
+            gh secret set PCC_REFRESH --repo "$GITHUB_REPOSITORY" < refresh-token.new
+            echo "PCC_REFRESH secret updated (token rotated this run)"
+            rm -f refresh-token.new
+          else
+            echo "No refresh-token rotation this run — secret unchanged"
+          fi

@@ -3,12 +3,18 @@
 // hardcoded appVersion). State machine logic IDENTICAL to Scriptable.
 //
 // Env vars:
-//   PCC_REFRESH      initial refresh token (bootstrap when state file missing)
+//   PCC_REFRESH      refresh token — bootstrap seed when state file missing.
+//                    Mint one locally with seed-token.mjs; the workflow keeps the
+//                    secret fresh on each rotation (see refresh-token writeback).
 //   PCC_DEVICE_GUID  comma-separated GUIDs (empty/missing => auto-pick ALL devices)
 //   PCC_DRY_RUN      'true' => only log, never call setParameters
 //   PCC_APP_VERSION  optional pin — empty => fetch from iTunes Lookup
 //   NTFY_TOPIC       ntfy.sh topic (empty => no push notifications)
 //   NTFY_BASE        default https://ntfy.sh
+//
+// Auth: cached access token (state file, persisted via Actions cache) reused
+// until ~10min before expiry — avoids refreshing every tick. When a fresh token
+// is needed, the refresh_token grant mints one (and rotates the refresh token).
 
 import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
@@ -22,6 +28,10 @@ const DRY_RUN             = process.env.PCC_DRY_RUN === 'true'
 const DRY_TARGET_TEMP     = 25
 const STEP_INTERVALS_SEC  = { 5: 180, 4: 300, 3: 600, 2: 600, 1: 600 }
 const STATE_FILE          = path.resolve('./state/pcc.json')
+// Written (no trailing newline) ONLY when the refresh token rotates this run.
+// The workflow pipes it into `gh secret set PCC_REFRESH` → durable across
+// Actions-cache eviction, so CI never needs the reCAPTCHA-gated login.
+const REFRESH_OUT_FILE    = path.resolve('./refresh-token.new')
 const NTFY_TOPIC          = process.env.NTFY_TOPIC || ''
 const NTFY_BASE           = process.env.NTFY_BASE || 'https://ntfy.sh'
 const APP_VERSION_OVERRIDE = process.env.PCC_APP_VERSION || ''
@@ -41,6 +51,9 @@ const CLIENT_ID   = 'Xmy6xIYIitMxngjB2rHvlm6HSDNnaMJx'
 const AUTH0_CLIENT= 'eyJuYW1lIjoiQXV0aDAuQW5kcm9pZCIsImVudiI6eyJhbmRyb2lkIjoiMzAifSwidmVyc2lvbiI6IjIuOS4zIn0='
 const FIXED_KEY   = '521325fb2dd486bf4831b47644317fca'
 const CC_NAME     = 'Comfort Cloud'
+
+const SCOPE        = 'openid offline_access comfortcloud.control a2w.control'
+const TOKEN_MARGIN_MS = 600_000 // refresh 10min before expiry (> 5min tick + jitter → never serve a stale token). Token TTL observed = 86400s (24h).
 
 let APP_VERSION = APP_VERSION_OVERRIDE || APP_VERSION_FALLBACK
 
@@ -108,6 +121,70 @@ async function fetchAppVersion() {
 }
 
 // ============================================================
+// Auth — refresh_token grant + access-token cache
+// ============================================================
+async function refreshGrant(refreshToken) {
+  return httpJson(`${AUTH_BASE}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Auth0-Client': AUTH0_CLIENT, 'Content-Type': 'application/json', 'User-Agent': 'okhttp/4.10.0' },
+    body: { scope: SCOPE, client_id: CLIENT_ID, refresh_token: refreshToken, grant_type: 'refresh_token' },
+  })
+}
+
+// Exchange access token for clientId. Doubles as a cached-token validity probe.
+async function loginV2(accessToken) {
+  const resp = await httpJson(`${API_BASE}/auth/v2/login`, {
+    method: 'POST',
+    headers: { ...getBaseHeaders(accessToken), 'X-User-Authorization-V2': 'Bearer ' + accessToken },
+    body: { language: 0 },
+  })
+  return resp.clientId
+}
+
+function cachedAccessToken(state) {
+  if (state.accessToken && state.accessTokenExpiresAt && (state.accessTokenExpiresAt - TOKEN_MARGIN_MS) > Date.now()) {
+    return state.accessToken
+  }
+  return null
+}
+function persistToken(state, tok) {
+  state.accessToken = tok.access_token
+  if (tok.refresh_token) state.refreshToken = tok.refresh_token // ROTATE
+  state.accessTokenExpiresAt = Date.now() + (Number(tok.expires_in) || 1800) * 1000
+}
+
+// Mint a fresh access token via the refresh_token grant (rotates the refresh token).
+async function mintAccessToken(state) {
+  if (!state.refreshToken) {
+    throw new Error('Cannot authenticate: no valid cached token and no refresh_token (seed PCC_REFRESH via seed-token.mjs)')
+  }
+  const tok = await refreshGrant(state.refreshToken)
+  persistToken(state, tok)
+  console.log('Auth: minted token via refresh_token')
+  return tok.access_token
+}
+
+// Returns { accessToken, clientId }. Reuses cached token when still valid.
+async function authenticate(state) {
+  const cached = cachedAccessToken(state)
+  if (cached) {
+    try {
+      const clientId = await loginV2(cached)
+      const leftSec = Math.round((state.accessTokenExpiresAt - Date.now()) / 1000)
+      console.log(`Auth: reused cached access token (~${leftSec}s left)`)
+      return { accessToken: cached, clientId }
+    } catch (e) {
+      console.log('Auth: cached token rejected —', e.message, '— re-authenticating')
+      state.accessToken = null
+      state.accessTokenExpiresAt = null
+    }
+  }
+  const accessToken = await mintAccessToken(state)
+  const clientId = await loginV2(accessToken)
+  return { accessToken, clientId }
+}
+
+// ============================================================
 // State helpers
 // ============================================================
 async function loadState() {
@@ -124,8 +201,8 @@ async function loadState() {
   } catch (e) {
     if (e.code !== 'ENOENT') throw e
     const seed = process.env.PCC_REFRESH
-    if (!seed) throw new Error('No state file and PCC_REFRESH env not set — cannot bootstrap')
-    return { refreshToken: seed, transitions: {} }
+    if (seed) return { refreshToken: seed, transitions: {} }
+    throw new Error('No state file and PCC_REFRESH not set — cannot bootstrap')
   }
 }
 async function saveState(state) {
@@ -272,7 +349,7 @@ async function processDevice({ guid, name }, state, accessToken, clientId) {
       !(p.temperatureSet >= DRY_TARGET_TEMP && p.ecoMode === ECO_QUIET)
     if (p.operate === POWER_ON && (coolTrigger || dryTrigger)) {
       const plan = buildTransitionPlan(p.fanSpeed, p.ecoMode)
-      stateToPersist = { startMs: Date.now(), plan, lastAppliedIdx: 0, deviceGuid: guid }
+      stateToPersist = { startMs: Date.now(), plan, lastAppliedIdx: 0 }
       applyParams = plan[0].params
       const from = coolTrigger ? 'COOL' : 'DRY'
       actionTaken = `started transition from ${from} (initial fan=${plan[0].params.fanSpeed}, ${plan.length} steps, total ${plan[plan.length - 1].atSec}s)`
@@ -313,36 +390,21 @@ async function processDevice({ guid, name }, state, accessToken, clientId) {
 // ============================================================
 async function main() {
   const state = await loadState()
-  if (!state.refreshToken) throw new Error('No refreshToken in state')
+  const initialRefresh = state.refreshToken
 
   APP_VERSION = await fetchAppVersion()
   console.log('X-APP-VERSION =', APP_VERSION)
 
-  // 1. Refresh OAuth token
-  const tokenResp = await httpJson(`${AUTH_BASE}/oauth/token`, {
-    method: 'POST',
-    headers: {
-      'Auth0-Client': AUTH0_CLIENT,
-      'Content-Type': 'application/json',
-      'User-Agent': 'okhttp/4.10.0'
-    },
-    body: {
-      scope: 'openid offline_access comfortcloud.control a2w.control',
-      client_id: CLIENT_ID,
-      refresh_token: state.refreshToken,
-      grant_type: 'refresh_token'
-    }
-  })
-  const accessToken = tokenResp.access_token
-  state.refreshToken = tokenResp.refresh_token // ROTATE — must persist even if downstream fails
+  // 1+2. Authenticate (cached token → refresh_token → username/password) + clientId.
+  // state token fields rotate inside — persisted by saveState below even on failure.
+  const { accessToken, clientId } = await authenticate(state)
 
-  // 2. Get clientId
-  const loginResp = await httpJson(`${API_BASE}/auth/v2/login`, {
-    method: 'POST',
-    headers: { ...getBaseHeaders(accessToken), 'X-User-Authorization-V2': 'Bearer ' + accessToken },
-    body: { language: 0 }
-  })
-  const clientId = loginResp.clientId
+  // Refresh token rotated? Emit it for the workflow to push into the PCC_REFRESH
+  // secret (durable cold-start seed). Done now — survives a later device-loop failure.
+  if (state.refreshToken && state.refreshToken !== initialRefresh) {
+    await fs.writeFile(REFRESH_OUT_FILE, state.refreshToken, 'utf8')
+    console.log('Refresh token rotated → wrote', path.basename(REFRESH_OUT_FILE), 'for secret writeback')
+  }
 
   // 3. Resolve devices from groups (call once)
   const groupsResp = await httpJson(`${API_BASE}/device/group/`, {
@@ -357,7 +419,6 @@ async function main() {
 
   // 4. Per-device loop (serial)
   let anyDeviceErrored = false
-  const notifyActions = [] // collect non-idle actions for notification
 
   for (const device of devices) {
     try {
@@ -366,7 +427,6 @@ async function main() {
         actionTaken.startsWith('transition active, no step due yet')
       // DRY_RUN: always notify to confirm pipeline reach. Production: skip idle to avoid spam.
       if (!isIdle || DRY_RUN) {
-        notifyActions.push({ name: device.name, action: actionTaken })
         await ntfy(
           `Panasonic AC ${device.name}`,
           actionTaken + (DRY_RUN ? ' [DRY_RUN]' : '')

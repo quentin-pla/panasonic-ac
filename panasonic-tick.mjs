@@ -19,7 +19,7 @@ import path from 'node:path'
 // ============================================================
 const DEVICE_GUIDS_ENV     = process.env.PCC_DEVICE_GUID || ''
 const DRY_RUN             = process.env.PCC_DRY_RUN === 'true'
-const DRY_TARGET_TEMP     = 24
+const DRY_TARGET_TEMP     = 25
 const STEP_INTERVALS_SEC  = { 5: 180, 4: 300, 3: 600, 2: 600, 1: 600 }
 const STATE_FILE          = path.resolve('./state/pcc.json')
 const NTFY_TOPIC          = process.env.NTFY_TOPIC || ''
@@ -262,13 +262,22 @@ async function processDevice({ guid, name }, state, accessToken, clientId) {
       }
     }
   } else {
-    if (p.operate === POWER_ON && p.operationMode === MODE_COOL) {
+    // Trigger when AC ON and either:
+    //   COOL — any COOL state (convert to DRY + ramp fan down to QUIET)
+    //   DRY  — user left it above target: setTemp below DRY_TARGET_TEMP, OR
+    //          ecoMode != QUIET (power above QUIET). Skip fanSpeed check —
+    //          under QUIET the API may report fanSpeed != 1 → infinite re-trigger.
+    const coolTrigger = p.operationMode === MODE_COOL
+    const dryTrigger = p.operationMode === MODE_DRY &&
+      !(p.temperatureSet >= DRY_TARGET_TEMP && p.ecoMode === ECO_QUIET)
+    if (p.operate === POWER_ON && (coolTrigger || dryTrigger)) {
       const plan = buildTransitionPlan(p.fanSpeed, p.ecoMode)
       stateToPersist = { startMs: Date.now(), plan, lastAppliedIdx: 0, deviceGuid: guid }
       applyParams = plan[0].params
-      actionTaken = `started transition (initial fan=${plan[0].params.fanSpeed}, ${plan.length} steps, total ${plan[plan.length - 1].atSec}s)`
+      const from = coolTrigger ? 'COOL' : 'DRY'
+      actionTaken = `started transition from ${from} (initial fan=${plan[0].params.fanSpeed}, ${plan.length} steps, total ${plan[plan.length - 1].atSec}s)`
     } else {
-      actionTaken = 'idle (not in COOL mode)'
+      actionTaken = 'idle (no trigger condition)'
     }
   }
 
@@ -353,7 +362,7 @@ async function main() {
   for (const device of devices) {
     try {
       const actionTaken = await processDevice(device, state, accessToken, clientId)
-      const isIdle = actionTaken === 'none' || actionTaken === 'idle (not in COOL mode)' ||
+      const isIdle = actionTaken === 'none' || actionTaken.startsWith('idle') ||
         actionTaken.startsWith('transition active, no step due yet')
       // DRY_RUN: always notify to confirm pipeline reach. Production: skip idle to avoid spam.
       if (!isIdle || DRY_RUN) {

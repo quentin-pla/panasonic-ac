@@ -100,7 +100,9 @@ async function httpJson(url, { method = 'GET', headers = {}, body = null } = {})
   try { data = text ? JSON.parse(text) : null } catch { data = text }
   if (!res.ok) {
     console.log(`${method} ${url} -> ${res.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`)
-    throw new Error(`HTTP ${res.status} from ${url}`)
+    const err = new Error(`HTTP ${res.status} from ${url}`)
+    err.status = res.status
+    throw err
   }
   return data
 }
@@ -154,14 +156,34 @@ function persistToken(state, tok) {
 }
 
 // Mint a fresh access token via the refresh_token grant (rotates the refresh token).
+// Tries the cached/state token first, then the PCC_REFRESH secret as a recovery
+// fallback — so a dead cached token (rotation desync / family revoked) self-heals
+// from a freshly-seeded secret WITHOUT manually clearing the Actions cache.
+// Fallback ONLY on auth rejection (400/401/403); a transient/5xx error rethrows
+// immediately so we never rotate the seed family and cause a new desync.
 async function mintAccessToken(state) {
-  if (!state.refreshToken) {
-    throw new Error('Cannot authenticate: no valid cached token and no refresh_token (seed PCC_REFRESH via seed-token.mjs)')
+  const seed = process.env.PCC_REFRESH
+  const candidates = []
+  if (state.refreshToken) candidates.push({ rt: state.refreshToken, src: 'state' })
+  if (seed && seed !== state.refreshToken) candidates.push({ rt: seed, src: 'PCC_REFRESH seed' })
+  if (!candidates.length) {
+    throw new Error('Cannot authenticate: no refresh_token in state and PCC_REFRESH not set (seed via seed-token.mjs)')
   }
-  const tok = await refreshGrant(state.refreshToken)
-  persistToken(state, tok)
-  console.log('Auth: minted token via refresh_token')
-  return tok.access_token
+  let lastErr
+  for (const { rt, src } of candidates) {
+    try {
+      const tok = await refreshGrant(rt)
+      persistToken(state, tok)
+      console.log(`Auth: minted token via refresh_token (${src})`)
+      return tok.access_token
+    } catch (e) {
+      lastErr = e
+      const authReject = [400, 401, 403].includes(e.status)
+      console.log(`Auth: refresh_token grant failed (${src})${authReject ? '' : ' [non-auth error — not trying others]'} —`, e.message)
+      if (!authReject) throw e
+    }
+  }
+  throw lastErr
 }
 
 // Returns { accessToken, clientId }. Reuses cached token when still valid.

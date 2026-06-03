@@ -56,6 +56,8 @@ const SCOPE        = 'openid offline_access comfortcloud.control a2w.control'
 const TOKEN_MARGIN_MS = 600_000 // refresh 10min before expiry (> 5min tick + jitter → never serve a stale token). Token TTL observed = 86400s (24h).
 const DEVICES_TTL_MS  = 86_400_000 // re-fetch device/group/ at most once per 24h — device list is stable
 const APP_VERSION_TTL_MS = 86_400_000 // re-fetch iTunes app version at most once per 24h — bumps every few weeks
+const TRANSIENT_RETRIES     = 3 // retry a CloudFront-WAF block / network error / 5xx this many times before giving up
+const BLOCK_ALARM_THRESHOLD = 3 // consecutive fully-blocked ticks before we alarm (high ntfy) + fail the run
 
 let APP_VERSION = APP_VERSION_OVERRIDE || APP_VERSION_FALLBACK
 
@@ -93,20 +95,61 @@ function getBaseHeaders(accessToken) {
 // ============================================================
 // HTTP helpers
 // ============================================================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// CloudFront/AWS-WAF "Request blocked" 403 — an edge-layer block (datacenter-IP
+// reputation), NOT an app/auth error. Body is HTML, not the usual JSON. Distinct
+// from the GET-with-body 403 (that says "Bad request"), which we never trigger.
+function looksLikeCloudFrontBlock(status, data) {
+  if (status !== 403) return false
+  const body = typeof data === 'string' ? data : JSON.stringify(data ?? '')
+  return /cloudfront|request could not be satisfied|request blocked/i.test(body)
+}
+
+// Retry only edge/transport failures, never an app-level auth reject (4xx). This
+// keeps the single-use refresh_token from being re-spent on a real rejection.
+function isTransient(err) {
+  return Boolean(err.cloudfrontBlocked) || Boolean(err.networkError) ||
+    (typeof err.status === 'number' && err.status >= 500 && err.status < 600)
+}
+
 async function httpJson(url, { method = 'GET', headers = {}, body = null } = {}) {
   const init = { method, headers }
   if (body !== null) init.body = typeof body === 'string' ? body : JSON.stringify(body)
-  const res = await fetch(url, init)
-  const text = await res.text()
-  let data = null
-  try { data = text ? JSON.parse(text) : null } catch { data = text }
-  if (!res.ok) {
-    console.log(`${method} ${url} -> ${res.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`)
-    const err = new Error(`HTTP ${res.status} from ${url}`)
-    err.status = res.status
-    throw err
+  let lastErr
+  for (let attempt = 0; attempt <= TRANSIENT_RETRIES; attempt++) {
+    try {
+      let res
+      try {
+        res = await fetch(url, init)
+      } catch (netErr) {
+        netErr.networkError = true // fetch rejected before any response (DNS/conn/TLS)
+        throw netErr
+      }
+      const text = await res.text()
+      let data = null
+      try { data = text ? JSON.parse(text) : null } catch { data = text }
+      if (!res.ok) {
+        console.log(`${method} ${url} -> ${res.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`)
+        const err = new Error(`HTTP ${res.status} from ${url}`)
+        err.status = res.status
+        if (looksLikeCloudFrontBlock(res.status, data)) err.cloudfrontBlocked = true
+        throw err
+      }
+      return data
+    } catch (e) {
+      lastErr = e
+      if (attempt < TRANSIENT_RETRIES && isTransient(e)) {
+        const reason = e.cloudfrontBlocked ? 'CloudFront block' : e.networkError ? 'network error' : `HTTP ${e.status}`
+        const backoff = 400 * 2 ** attempt + Math.floor(Math.random() * 300)
+        console.log(`Transient ${reason} on ${method} ${url} — retry ${attempt + 1}/${TRANSIENT_RETRIES} in ${backoff}ms`)
+        await sleep(backoff)
+        continue
+      }
+      throw e
+    }
   }
-  return data
+  throw lastErr
 }
 
 // ============================================================
@@ -191,7 +234,7 @@ async function mintAccessToken(state) {
       return tok.access_token
     } catch (e) {
       lastErr = e
-      const authReject = [400, 401, 403].includes(e.status)
+      const authReject = !e.cloudfrontBlocked && [400, 401, 403].includes(e.status)
       console.log(`Auth: refresh_token grant failed (${src})${authReject ? '' : ' [non-auth error — not trying others]'} —`, e.message)
       if (!authReject) throw e
     }
@@ -485,33 +528,44 @@ async function processDevice({ guid, name }, state, auth) {
 async function main() {
   const state = await loadState()
   const initialRefresh = state.refreshToken
-  let anyDeviceErrored = false
+  let blockOccurred = false, genuineError = false, anySuccess = false, failTick = false
 
   try {
     APP_VERSION = await fetchAppVersion(state)
     console.log('X-APP-VERSION =', APP_VERSION)
 
-    // 1+2. Authenticate (cached token+clientId fast path → refresh_token grant).
-    // Mutable holder so a mid-run 401 re-auth propagates to every later call.
-    const auth = await authenticate(state)
+    // 1+2+3. Authenticate + resolve devices. A CloudFront WAF block here is a
+    // transient edge block (datacenter IP) — flag it and skip the tick rather
+    // than crash the run. Genuine errors still propagate (real fatal).
+    let auth = null, devices = null
+    try {
+      // Authenticate (cached token+clientId fast path → refresh_token grant).
+      // Mutable holder so a mid-run 401 re-auth propagates to every later call.
+      auth = await authenticate(state)
 
-    // 3. Resolve devices — cached list (≤24h), filtered by PCC_DEVICE_GUID each tick.
-    const configuredGuids = DEVICE_GUIDS_ENV.split(',').map(s => s.trim()).filter(Boolean)
-    const cached = await getAllDevices(state, auth)
-    let devices = selectDevices(cached.list, configuredGuids)
-    if (!devices.length && cached.fromCache) {
-      // Nothing resolved from a cached list — it may be stale; refetch once before giving up.
-      console.log('No devices resolved from cached list — refreshing device/group/')
-      const refetched = await getAllDevices(state, auth, true)
-      devices = selectDevices(refetched.list, configuredGuids)
+      // Resolve devices — cached list (≤24h), filtered by PCC_DEVICE_GUID each tick.
+      const configuredGuids = DEVICE_GUIDS_ENV.split(',').map(s => s.trim()).filter(Boolean)
+      const cached = await getAllDevices(state, auth)
+      devices = selectDevices(cached.list, configuredGuids)
+      if (!devices.length && cached.fromCache) {
+        // Nothing resolved from a cached list — it may be stale; refetch once before giving up.
+        console.log('No devices resolved from cached list — refreshing device/group/')
+        const refetched = await getAllDevices(state, auth, true)
+        devices = selectDevices(refetched.list, configuredGuids)
+      }
+      if (!devices.length) throw new Error('No devices resolved — check account or PCC_DEVICE_GUID')
+      console.log('Devices:', devices.map(d => `${d.name} (${d.guid})`).join(', '))
+    } catch (e) {
+      if (!e.cloudfrontBlocked) throw e
+      blockOccurred = true
+      console.log('CloudFront WAF block during auth/device resolution — transient, skipping tick')
     }
-    if (!devices.length) throw new Error('No devices resolved — check account or PCC_DEVICE_GUID')
-    console.log('Devices:', devices.map(d => `${d.name} (${d.guid})`).join(', '))
 
-    // 4. Per-device loop (serial)
-    for (const device of devices) {
+    // 4. Per-device loop (serial) — only if auth + resolution succeeded.
+    for (const device of (devices || [])) {
       try {
         const actionTaken = await processDevice(device, state, auth)
+        anySuccess = true
         const isIdle = actionTaken === 'none' || actionTaken.startsWith('idle') ||
           actionTaken.startsWith('transition active, no step due yet')
         // DRY_RUN: always notify to confirm pipeline reach. Production: skip idle to avoid spam.
@@ -522,9 +576,32 @@ async function main() {
           )
         }
       } catch (e) {
-        console.error(`[${device.name}] Error:`, e?.stack || e)
-        anyDeviceErrored = true
-        await ntfy(`Panasonic AC ${device.name} ERROR`, e?.message || String(e), 'high')
+        if (e.cloudfrontBlocked) {
+          // Edge block (datacenter IP) — transient, not a device/app fault. Don't alarm.
+          blockOccurred = true
+          console.log(`[${device.name}] CloudFront WAF block — transient, skipping device`)
+        } else {
+          console.error(`[${device.name}] Error:`, e?.stack || e)
+          genuineError = true
+          await ntfy(`Panasonic AC ${device.name} ERROR`, e?.message || String(e), 'high')
+        }
+      }
+    }
+
+    // Tick outcome accounting (inside try → counter persisted by finally below).
+    // Single precedence chain: real error > any success > full block.
+    if (genuineError) {
+      failTick = true // real error → loud + fail; leave block counter untouched
+    } else if (anySuccess) {
+      state.consecutiveBlocks = 0 // egress IP worked this tick → reset
+    } else if (blockOccurred) {
+      state.consecutiveBlocks = (state.consecutiveBlocks || 0) + 1
+      if (state.consecutiveBlocks >= BLOCK_ALARM_THRESHOLD) {
+        console.error(`CloudFront WAF blocked ${state.consecutiveBlocks} consecutive ticks — alarming`)
+        await ntfy('Panasonic AC blocked', `CloudFront WAF blocked ${state.consecutiveBlocks} consecutive ticks`, 'high')
+        failTick = true
+      } else {
+        console.log(`CloudFront WAF block (transient) — consecutive=${state.consecutiveBlocks}/${BLOCK_ALARM_THRESHOLD}, exiting clean`)
       }
     }
   } finally {
@@ -537,7 +614,7 @@ async function main() {
     await saveState(state)
   }
 
-  if (anyDeviceErrored) {
+  if (failTick) {
     throw new Error('One or more devices failed — see logs above')
   }
 }
